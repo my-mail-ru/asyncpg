@@ -668,6 +668,24 @@ class TestPool(tb.ConnectedTestCase):
 
         self.assertGreaterEqual(N, 50)
 
+    async def test_pool_max_inactive_time_05(self):
+        # Test that idle never-acquired connections abide by
+        # the max inactive lifetime.
+        async with self.create_pool(
+                database='postgres', min_size=2, max_size=2,
+                max_inactive_connection_lifetime=0.2) as pool:
+
+            self.assertIsNotNone(pool._holders[0]._con)
+            self.assertIsNotNone(pool._holders[1]._con)
+
+            await pool.execute('SELECT pg_sleep(0.3)')
+            await asyncio.sleep(0.3, loop=self.loop)
+
+            self.assertIs(pool._holders[0]._con, None)
+            # The connection in the second holder was never used,
+            # but should be closed nonetheless.
+            self.assertIs(pool._holders[1]._con, None)
+
     async def test_pool_handles_inactive_connection_errors(self):
         pool = await self.create_pool(database='postgres',
                                       min_size=1, max_size=1)
@@ -880,6 +898,31 @@ class TestPool(tb.ConnectedTestCase):
 
         await pool_task
         await pool.close()
+
+    async def test_pool_remote_close(self):
+        pool = await self.create_pool(min_size=1, max_size=1)
+        backend_pid_fut = self.loop.create_future()
+
+        async def worker():
+            async with pool.acquire() as conn:
+                pool_backend_pid = await conn.fetchval(
+                    'SELECT pg_backend_pid()')
+                backend_pid_fut.set_result(pool_backend_pid)
+                await asyncio.sleep(0.2, loop=self.loop)
+
+        task = self.loop.create_task(worker())
+        try:
+            conn = await self.connect()
+            backend_pid = await backend_pid_fut
+            await conn.execute('SELECT pg_terminate_backend($1)', backend_pid)
+        finally:
+            await conn.close()
+
+        await task
+
+        # Check that connection_lost has released the pool holder.
+        conn = await pool.acquire(timeout=0.1)
+        await pool.release(conn)
 
 
 @unittest.skipIf(os.environ.get('PGHOST'), 'using remote cluster for testing')

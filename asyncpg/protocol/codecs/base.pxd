@@ -10,7 +10,7 @@ ctypedef object (*encode_func)(ConnectionSettings settings,
                                object obj)
 
 ctypedef object (*decode_func)(ConnectionSettings settings,
-                               FastReadBuffer buf)
+                               FRBuffer *buf)
 
 ctypedef object (*codec_encode_func)(Codec codec,
                                      ConnectionSettings settings,
@@ -19,7 +19,7 @@ ctypedef object (*codec_encode_func)(Codec codec,
 
 ctypedef object (*codec_decode_func)(Codec codec,
                                      ConnectionSettings settings,
-                                     FastReadBuffer buf)
+                                     FRBuffer *buf)
 
 
 cdef enum CodecType:
@@ -67,6 +67,7 @@ cdef class Codec:
         # composite types
         tuple           element_type_oids
         object          element_names
+        object          record_desc
         list            element_codecs
 
         # Pointers to actual encoder/decoder functions for this codec
@@ -100,29 +101,24 @@ cdef class Codec:
     cdef encode_in_python(self, ConnectionSettings settings, WriteBuffer buf,
                           object obj)
 
-    cdef decode_scalar(self, ConnectionSettings settings, FastReadBuffer buf)
+    cdef decode_scalar(self, ConnectionSettings settings, FRBuffer *buf)
 
-    cdef decode_array(self, ConnectionSettings settings, FastReadBuffer buf)
+    cdef decode_array(self, ConnectionSettings settings, FRBuffer *buf)
 
-    cdef decode_array_text(self, ConnectionSettings settings,
-                           FastReadBuffer buf)
+    cdef decode_array_text(self, ConnectionSettings settings, FRBuffer *buf)
 
-    cdef decode_range(self, ConnectionSettings settings, FastReadBuffer buf)
+    cdef decode_range(self, ConnectionSettings settings, FRBuffer *buf)
 
-    cdef decode_composite(self, ConnectionSettings settings,
-                          FastReadBuffer buf)
+    cdef decode_composite(self, ConnectionSettings settings, FRBuffer *buf)
 
-    cdef decode_in_python(self, ConnectionSettings settings,
-                          FastReadBuffer buf)
+    cdef decode_in_python(self, ConnectionSettings settings, FRBuffer *buf)
 
     cdef inline encode(self,
                        ConnectionSettings settings,
                        WriteBuffer buf,
                        object obj)
 
-    cdef inline decode(self,
-                       ConnectionSettings settings,
-                       FastReadBuffer buf)
+    cdef inline decode(self, ConnectionSettings settings, FRBuffer *buf)
 
     cdef has_encoder(self)
     cdef has_decoder(self)
@@ -171,4 +167,4 @@ cdef class DataCodecConfig:
         dict _custom_type_codecs
 
     cdef inline Codec get_codec(self, uint32_t oid, ServerDataFormat format)
-    cdef inline Codec get_local_codec(self, uint32_t oid)
+    cdef inline Codec get_any_local_codec(self, uint32_t oid)

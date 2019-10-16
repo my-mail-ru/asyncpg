@@ -32,3 +32,6 @@ docs/_build
 .coverage
 /.pytest_cache/
 /.eggs
+/.vscode
+/.mypy_cache
+/venv

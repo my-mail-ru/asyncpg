@@ -291,6 +291,12 @@ class Connection(metaclass=ConnectionMeta):
         :param float timeout: Optional timeout value in seconds.
         :return None: This method discards the results of the operations.
 
+        .. note::
+
+           When inserting a large number of rows,
+           use :meth:`Connection.copy_records_to_table()` instead,
+           it is much more efficient for this purpose.
+
         .. versionadded:: 0.7.0
 
         .. versionchanged:: 0.11.0
@@ -524,7 +530,7 @@ class Connection(metaclass=ConnectionMeta):
         :param str query:
             The query to copy the results of.
 
-        :param \*args:
+        :param args:
             Query arguments.
 
         :param output:
@@ -990,29 +996,57 @@ class Connection(metaclass=ConnectionMeta):
         self._drop_local_statement_cache()
 
     async def set_builtin_type_codec(self, typename, *,
-                                     schema='public', codec_name):
-        """Set a builtin codec for the specified data type.
+                                     schema='public', codec_name,
+                                     format=None):
+        """Set a builtin codec for the specified scalar data type.
 
-        :param typename:  Name of the data type the codec is for.
-        :param schema:  Schema name of the data type the codec is for
-                        (defaults to 'public')
-        :param codec_name:  The name of the builtin codec.
+        This method has two uses.  The first is to register a builtin
+        codec for an extension type without a stable OID, such as 'hstore'.
+        The second use is to declare that an extension type or a
+        user-defined type is wire-compatible with a certain builtin
+        data type and should be exchanged as such.
+
+        :param typename:
+            Name of the data type the codec is for.
+
+        :param schema:
+            Schema name of the data type the codec is for
+            (defaults to ``'public'``).
+
+        :param codec_name:
+            The name of the builtin codec to use for the type.
+            This should be either the name of a known core type
+            (such as ``"int"``), or the name of a supported extension
+            type.  Currently, the only supported extension type is
+            ``"pg_contrib.hstore"``.
+
+        :param format:
+            If *format* is ``None`` (the default), all formats supported
+            by the target codec are declared to be supported for *typename*.
+            If *format* is ``'text'`` or ``'binary'``, then only the
+            specified format is declared to be supported for *typename*.
+
+        .. versionchanged:: 0.18.0
+            The *codec_name* argument can be the name of any known
+            core data type.  Added the *format* keyword argument.
         """
         self._check_open()
 
         typeinfo = await self.fetchrow(
             introspection.TYPE_BY_NAME, typename, schema)
         if not typeinfo:
-            raise ValueError('unknown type: {}.{}'.format(schema, typename))
+            raise exceptions.InterfaceError(
+                'unknown type: {}.{}'.format(schema, typename))
 
-        oid = typeinfo['oid']
-        if typeinfo['kind'] != b'b' or typeinfo['elemtype']:
-            raise ValueError(
+        if not introspection.is_scalar_type(typeinfo):
+            raise exceptions.InterfaceError(
                 'cannot alias non-scalar type {}.{}'.format(
                     schema, typename))
 
+        oid = typeinfo['oid']
+
         self._protocol.get_settings().set_builtin_type_codec(
-            oid, typename, schema, 'scalar', codec_name)
+            oid, typename, schema, 'scalar', codec_name, format)
 
         # Statement cache is no longer valid due to codec changes.
         self._drop_local_statement_cache()
@@ -1464,58 +1498,100 @@ async def connect(dsn=None, *,
                   server_settings=None):
     r"""A coroutine to establish a connection to a PostgreSQL server.
 
+    The connection parameters may be specified either as a connection
+    URI in *dsn*, or as specific keyword arguments, or both.
+    If both *dsn* and keyword arguments are specified, the latter
+    override the corresponding values parsed from the connection URI.
+    The default values for the majority of arguments can be specified
+    using `environment variables <postgres envvars>`_.
+
     Returns a new :class:`~asyncpg.connection.Connection` object.
 
     :param dsn:
         Connection arguments specified using as a single string in the
-        following format:
-        ``postgres://user:pass@host:port/database?option=value``
+        `libpq connection URI format`_:
+        ``postgres://user:password@host:port/database?option=value``.
+        The following options are recognized by asyncpg: host, port,
+        user, database (or dbname), password, passfile, sslmode.
+        Unlike libpq, asyncpg will treat unrecognized options
+        as `server settings`_ to be used for the connection.
 
     :param host:
-        database host address or a path to the directory containing
-        database server UNIX socket (defaults to the default UNIX socket,
-        or the value of the ``PGHOST`` environment variable, if set).
+        Database host address as one of the following:
+
+        - an IP address or a domain name;
+        - an absolute path to the directory containing the database
+          server Unix-domain socket (not supported on Windows);
+        - a sequence of any of the above, in which case the addresses
+          will be tried in order, and the first successful connection
+          will be returned.
+
+        If not specified, asyncpg will try the following, in order:
+
+        - host address(es) parsed from the *dsn* argument,
+        - the value of the ``PGHOST`` environment variable,
+        - on Unix, common directories used for PostgreSQL Unix-domain
+          sockets: ``"/run/postgresql"``, ``"/var/run/postgresl"``,
+          ``"/var/pgsql_socket"``, ``"/private/tmp"``, and ``"/tmp"``,
+        - ``"localhost"``.
 
     :param port:
-        connection port number (defaults to ``5432``, or the value of
-        the ``PGPORT`` environment variable, if set)
+        Port number to connect to at the server host
+        (or Unix-domain socket file extension).  If multiple host
+        addresses were specified, this parameter may specify a
+        sequence of port numbers of the same length as the host sequence,
+        or it may specify a single port number to be used for all host
+        addresses.
+
+        If not specified, the value parsed from the *dsn* argument is used,
+        or the value of the ``PGPORT`` environment variable, or ``5432`` if
+        neither is specified.
 
     :param user:
-        the name of the database role used for authentication
-        (defaults to the name of the effective user of the process
-        making the connection, or the value of ``PGUSER`` environment
-        variable, if set)
+        The name of the database role used for authentication.
+
+        If not specified, the value parsed from the *dsn* argument is used,
+        or the value of the ``PGUSER`` environment variable, or the
+        operating system name of the user running the application.
 
     :param database:
-        the name of the database (defaults to the value of ``PGDATABASE``
-        environment variable, if set.)
+        The name of the database to connect to.
+
+        If not specified, the value parsed from the *dsn* argument is used,
+        or the value of the ``PGDATABASE`` environment variable, or the
+        operating system name of the user running the application.
 
     :param password:
-        password used for authentication
+        Password to be used for authentication, if the server requires
+        one.  If not specified, the value parsed from the *dsn* argument
+        is used, or the value of the ``PGPASSWORD`` environment variable.
+        Note that the use of the environment variable is discouraged as
+        other users and applications may be able to read it without needing
+        specific privileges.  It is recommended to use *passfile* instead.
 
     :param passfile:
-        the name of the file used to store passwords
+        The name of the file used to store passwords
         (defaults to ``~/.pgpass``, or ``%APPDATA%\postgresql\pgpass.conf``
-        on Windows)
+        on Windows).
 
     :param loop:
         An asyncio event loop instance.  If ``None``, the default
         event loop will be used.
 
     :param float timeout:
-        connection timeout in seconds.
+        Connection timeout in seconds.
 
     :param int statement_cache_size:
-        the size of prepared statement LRU cache.  Pass ``0`` to
+        The size of prepared statement LRU cache.  Pass ``0`` to
         disable the cache.
 
     :param int max_cached_statement_lifetime:
-        the maximum time in seconds a prepared statement will stay
+        The maximum time in seconds a prepared statement will stay
         in the cache.  Pass ``0`` to allow statements be cached
         indefinitely.
 
     :param int max_cacheable_statement_size:
-        the maximum size of a statement that can be cached (15KiB by
+        The maximum size of a statement that can be cached (15KiB by
         default).  Pass ``0`` to allow all statements to be cached
         regardless of their size.
 
@@ -1529,21 +1605,22 @@ async def connect(dsn=None, *,
         only.
 
     :param float command_timeout:
-        the default timeout for operations on this connection
+        The default timeout for operations on this connection
         (the default is ``None``: no timeout).
 
     :param ssl:
-        pass ``True`` or an `ssl.SSLContext <SSLContext_>`_ instance to
+        Pass ``True`` or an `ssl.SSLContext <SSLContext_>`_ instance to
         require an SSL connection.  If ``True``, a default SSL context
         returned by `ssl.create_default_context() <create_default_context_>`_
         will be used.
 
     :param dict server_settings:
-        an optional dict of server runtime parameters.  Refer to
-        PostgreSQL documentation for a `list of supported options`_.
+        An optional dict of server runtime parameters.  Refer to
+        PostgreSQL documentation for
+        a `list of supported options <server settings>`_.
 
     :param Connection connection_class:
-        class of the returned connection object.  Must be a subclass of
+        Class of the returned connection object.  Must be a subclass of
         :class:`~asyncpg.connection.Connection`.
 
     :return: A :class:`~asyncpg.connection.Connection` instance.
@@ -1577,11 +1654,20 @@ async def connect(dsn=None, *,
        Added ``passfile`` parameter
        (and support for password files in general).
 
+    .. versionadded:: 0.18.0
+       Added ability to specify multiple hosts in the *dsn*
+       and *host* arguments.
+
     .. _SSLContext: https://docs.python.org/3/library/ssl.html#ssl.SSLContext
     .. _create_default_context:
         https://docs.python.org/3/library/ssl.html#ssl.create_default_context
-    .. _list of supported options:
+    .. _server settings:
         https://www.postgresql.org/docs/current/static/runtime-config.html
+    .. _postgres envvars:
+        https://www.postgresql.org/docs/current/static/libpq-envars.html
+    .. _libpq connection URI format:
+        https://www.postgresql.org/docs/current/static/\
+        libpq-connect.html#LIBPQ-CONNSTRING
     """
     if not issubclass(connection_class, Connection):
         raise TypeError(
@@ -1708,12 +1794,17 @@ class _StatementCache:
         return (e._statement for e in self._entries.values())
 
     def clear(self):
-        # First, make sure that we cancel all scheduled callbacks.
-        for entry in self._entries.values():
-            self._clear_entry_callback(entry)
+        # Store entries for later.
+        entries = tuple(self._entries.values())
 
         # Clear the entries dict.
         self._entries.clear()
+
+        # Make sure that we cancel all scheduled callbacks
+        # and call on_remove callback for each entry.
+        for entry in entries:
+            self._clear_entry_callback(entry)
+            self._on_remove(entry._statement)
 
     def _set_entry_timeout(self, entry):
         # Clear the existing timeout.

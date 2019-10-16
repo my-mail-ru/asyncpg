@@ -14,8 +14,6 @@ cdef class PreparedStatementState:
 
         public bint need_reprepare
 
-        FastReadBuffer buffer
-
         list         row_desc
         list         parameters_desc
 

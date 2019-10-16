@@ -5,8 +5,11 @@
 # the Apache 2.0 License: http://www.apache.org/licenses/LICENSE-2.0
 
 
+from asyncpg import exceptions
+
+
 @cython.final
-cdef class ConnectionSettings:
+cdef class ConnectionSettings(pgproto.CodecContext):
 
     def __cinit__(self, conn_key):
         self._encoding = 'utf-8'
@@ -23,10 +26,10 @@ cdef class ConnectionSettings:
             self._encoding = self._codec.name
             self._is_utf8 = self._encoding == 'utf-8'
 
-    cdef inline is_encoding_utf8(self):
+    cdef is_encoding_utf8(self):
         return self._is_utf8
 
-    cpdef inline get_text_codec(self):
+    cpdef get_text_codec(self):
         return self._codec
 
     cpdef inline register_data_types(self, types):
@@ -48,7 +51,7 @@ cdef class ConnectionSettings:
             _format = PG_FORMAT_ANY
             xformat = PG_XFORMAT_TUPLE
         else:
-            raise ValueError(
+            raise exceptions.InterfaceError(
                 'invalid `format` argument, expected {}, got {!r}'.format(
                     "'text', 'binary' or 'tuple'", format
                 ))
@@ -64,9 +67,24 @@ cdef class ConnectionSettings:
         self._data_codecs.clear_type_cache()
 
     cpdef inline set_builtin_type_codec(self, typeoid, typename, typeschema,
-                                        typekind, alias_to):
+                                        typekind, alias_to, format):
+        cdef:
+            ServerDataFormat _format
+
+        if format is None:
+            _format = PG_FORMAT_ANY
+        elif format == 'binary':
+            _format = PG_FORMAT_BINARY
+        elif format == 'text':
+            _format = PG_FORMAT_TEXT
+        else:
+            raise exceptions.InterfaceError(
+                'invalid `format` argument, expected {}, got {!r}'.format(
+                    "'text' or 'binary'", format
+                ))
+
         self._data_codecs.set_builtin_type_codec(typeoid, typename, typeschema,
-                                          typekind, alias_to)
+                                                 typekind, alias_to, _format)
 
     cpdef inline Codec get_data_codec(self, uint32_t oid,
                                       ServerDataFormat format=PG_FORMAT_ANY):

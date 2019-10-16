@@ -5,7 +5,9 @@
 # the Apache 2.0 License: http://www.apache.org/licenses/LICENSE-2.0
 
 
-from asyncpg.exceptions import OutdatedSchemaCacheError
+from collections.abc import Mapping as MappingABC
+
+from asyncpg import exceptions
 
 
 cdef void* binary_codec_map[(MAXSUPPORTEDOID + 1) * 2]
@@ -43,12 +45,13 @@ cdef class Codec:
         self.element_type_oids = element_type_oids
         self.element_codecs = element_codecs
         self.element_delimiter = element_delimiter
+        self.element_names = element_names
 
         if element_names is not None:
-            self.element_names = record.ApgRecordDesc_New(
+            self.record_desc = record.ApgRecordDesc_New(
                 element_names, tuple(element_names))
         else:
-            self.element_names = None
+            self.record_desc = None
 
         if type == CODEC_C:
             self.encoder = <codec_encode_func>&self.encode_scalar
@@ -62,15 +65,15 @@ cdef class Codec:
                 self.decoder = <codec_decode_func>&self.decode_array_text
         elif type == CODEC_RANGE:
             if format != PG_FORMAT_BINARY:
-                raise RuntimeError(
-                    'cannot encode type "{}"."{}": text encoding of '
+                raise NotImplementedError(
+                    'cannot decode type "{}"."{}": text encoding of '
                     'range types is not supported'.format(schema, name))
             self.encoder = <codec_encode_func>&self.encode_range
             self.decoder = <codec_decode_func>&self.decode_range
         elif type == CODEC_COMPOSITE:
             if format != PG_FORMAT_BINARY:
-                raise RuntimeError(
-                    'cannot encode type "{}"."{}": text encoding of '
+                raise NotImplementedError(
+                    'cannot decode type "{}"."{}": text encoding of '
                     'composite types is not supported'.format(schema, name))
             self.encoder = <codec_encode_func>&self.encode_composite
             self.decoder = <codec_decode_func>&self.decode_composite
@@ -78,7 +81,8 @@ cdef class Codec:
             self.encoder = <codec_encode_func>&self.encode_in_python
             self.decoder = <codec_decode_func>&self.decode_in_python
         else:
-            raise RuntimeError('unexpected codec type: {}'.format(type))
+            raise exceptions.InternalClientError(
+                'unexpected codec type: {}'.format(type))
 
     cdef Codec copy(self):
         cdef Codec codec
@@ -124,6 +128,31 @@ cdef class Codec:
             int i
             list elem_codecs = self.element_codecs
             ssize_t count
+            ssize_t composite_size
+            tuple rec
+
+        if isinstance(obj, MappingABC):
+            # Input is dict-like, form a tuple
+            composite_size = len(self.element_type_oids)
+            rec = cpython.PyTuple_New(composite_size)
+
+            for i in range(composite_size):
+                cpython.Py_INCREF(None)
+                cpython.PyTuple_SET_ITEM(rec, i, None)
+
+            for field in obj:
+                try:
+                    i = self.element_names[field]
+                except KeyError:
+                    raise ValueError(
+                        '{!r} is not a valid element of composite '
+                        'type {}'.format(field, self.name)) from None
+
+                item = obj[field]
+                cpython.Py_INCREF(item)
+                cpython.PyTuple_SET_ITEM(rec, i, item)
+
+            obj = rec
 
         count = len(obj)
         if count > _MAXINT32:
@@ -146,41 +175,41 @@ cdef class Codec:
         data = self.py_encoder(obj)
         if self.xformat == PG_XFORMAT_OBJECT:
             if self.format == PG_FORMAT_BINARY:
-                bytea_encode(settings, buf, data)
+                pgproto.bytea_encode(settings, buf, data)
             elif self.format == PG_FORMAT_TEXT:
-                text_encode(settings, buf, data)
+                pgproto.text_encode(settings, buf, data)
             else:
-                raise RuntimeError(
+                raise exceptions.InternalClientError(
                     'unexpected data format: {}'.format(self.format))
         elif self.xformat == PG_XFORMAT_TUPLE:
             self.c_encoder(settings, buf, data)
         else:
-            raise RuntimeError(
+            raise exceptions.InternalClientError(
                 'unexpected exchange format: {}'.format(self.xformat))
 
     cdef encode(self, ConnectionSettings settings, WriteBuffer buf,
                 object obj):
         return self.encoder(self, settings, buf, obj)
 
-    cdef decode_scalar(self, ConnectionSettings settings, FastReadBuffer buf):
+    cdef decode_scalar(self, ConnectionSettings settings, FRBuffer *buf):
         return self.c_decoder(settings, buf)
 
-    cdef decode_array(self, ConnectionSettings settings, FastReadBuffer buf):
+    cdef decode_array(self, ConnectionSettings settings, FRBuffer *buf):
         return array_decode(settings, buf, codec_decode_func_ex,
                             <void*>(<cpython.PyObject>self.element_codec))
 
     cdef decode_array_text(self, ConnectionSettings settings,
-                           FastReadBuffer buf):
+                           FRBuffer *buf):
         return textarray_decode(settings, buf, codec_decode_func_ex,
                                 <void*>(<cpython.PyObject>self.element_codec),
                                 self.element_delimiter)
 
-    cdef decode_range(self, ConnectionSettings settings, FastReadBuffer buf):
+    cdef decode_range(self, ConnectionSettings settings, FRBuffer *buf):
         return range_decode(settings, buf, codec_decode_func_ex,
                             <void*>(<cpython.PyObject>self.element_codec))
 
     cdef decode_composite(self, ConnectionSettings settings,
-                          FastReadBuffer buf):
+                          FRBuffer *buf):
         cdef:
             object result
             ssize_t elem_count
@@ -189,11 +218,11 @@ cdef class Codec:
             uint32_t elem_typ
             uint32_t received_elem_typ
             Codec elem_codec
-            FastReadBuffer elem_buf = FastReadBuffer.new()
+            FRBuffer elem_buf
 
-        elem_count = <ssize_t><uint32_t>hton.unpack_int32(buf.read(4))
+        elem_count = <ssize_t><uint32_t>hton.unpack_int32(frb_read(buf, 4))
         if elem_count != len(self.element_type_oids):
-            raise OutdatedSchemaCacheError(
+            raise exceptions.OutdatedSchemaCacheError(
                 'unexpected number of attributes of composite type: '
                 '{}, expected {}'
                     .format(
@@ -203,32 +232,34 @@ cdef class Codec:
                 schema=self.schema,
                 data_type=self.name,
             )
-        result = record.ApgRecord_New(self.element_names, elem_count)
+        result = record.ApgRecord_New(self.record_desc, elem_count)
         for i in range(elem_count):
             elem_typ = self.element_type_oids[i]
-            received_elem_typ = <uint32_t>hton.unpack_int32(buf.read(4))
+            received_elem_typ = <uint32_t>hton.unpack_int32(frb_read(buf, 4))
 
             if received_elem_typ != elem_typ:
-                raise OutdatedSchemaCacheError(
+                raise exceptions.OutdatedSchemaCacheError(
                     'unexpected data type of composite type attribute {}: '
                     '{!r}, expected {!r}'
                         .format(
                             i,
-                            TYPEMAP.get(received_elem_typ, received_elem_typ),
-                            TYPEMAP.get(elem_typ, elem_typ)
+                            BUILTIN_TYPE_OID_MAP.get(
+                                received_elem_typ, received_elem_typ),
+                            BUILTIN_TYPE_OID_MAP.get(
+                                elem_typ, elem_typ)
                         ),
                     schema=self.schema,
                     data_type=self.name,
                     position=i,
                 )
 
-            elem_len = hton.unpack_int32(buf.read(4))
+            elem_len = hton.unpack_int32(frb_read(buf, 4))
             if elem_len == -1:
                 elem = None
             else:
                 elem_codec = self.element_codecs[i]
-                elem = elem_codec.decode(settings,
-                                         elem_buf.slice_from(buf, elem_len))
+                elem = elem_codec.decode(
+                    settings, frb_slice_from(&elem_buf, buf, elem_len))
 
             cpython.Py_INCREF(elem)
             record.ApgRecord_SET_ITEM(result, i, elem)
@@ -236,24 +267,24 @@ cdef class Codec:
         return result
 
     cdef decode_in_python(self, ConnectionSettings settings,
-                          FastReadBuffer buf):
+                          FRBuffer *buf):
         if self.xformat == PG_XFORMAT_OBJECT:
             if self.format == PG_FORMAT_BINARY:
-                data = bytea_decode(settings, buf)
+                data = pgproto.bytea_decode(settings, buf)
             elif self.format == PG_FORMAT_TEXT:
-                data = text_decode(settings, buf)
+                data = pgproto.text_decode(settings, buf)
             else:
-                raise RuntimeError(
+                raise exceptions.InternalClientError(
                     'unexpected data format: {}'.format(self.format))
         elif self.xformat == PG_XFORMAT_TUPLE:
             data = self.c_decoder(settings, buf)
         else:
-            raise RuntimeError(
+            raise exceptions.InternalClientError(
                 'unexpected exchange format: {}'.format(self.xformat))
 
         return self.py_decoder(data)
 
-    cdef inline decode(self, ConnectionSettings settings, FastReadBuffer buf):
+    cdef inline decode(self, ConnectionSettings settings, FRBuffer *buf):
         return self.decoder(self, settings, buf)
 
     cdef inline has_encoder(self):
@@ -367,7 +398,7 @@ cdef codec_encode_func_ex(ConnectionSettings settings, WriteBuffer buf,
 
 
 # Decode callback for arrays
-cdef codec_decode_func_ex(ConnectionSettings settings, FastReadBuffer buf,
+cdef codec_decode_func_ex(ConnectionSettings settings, FRBuffer *buf,
                           const void *arg):
     return (<Codec>arg).decode(settings, buf)
 
@@ -455,7 +486,7 @@ cdef class DataCodecConfig:
 
             elif ti['kind'] == b'c':
                 if not comp_type_attrs:
-                    raise RuntimeError(
+                    raise exceptions.InternalClientError(
                         'type record missing field types for '
                         'composite {}'.format(oid))
 
@@ -469,7 +500,7 @@ cdef class DataCodecConfig:
                         elem_codec = self.get_codec(typoid, PG_FORMAT_TEXT)
                         has_text_elements = True
                     if elem_codec is None:
-                        raise RuntimeError(
+                        raise exceptions.InternalClientError(
                             'no codec for composite attribute type {}'.format(
                                 typoid))
                     comp_elem_codecs.append(elem_codec)
@@ -490,7 +521,7 @@ cdef class DataCodecConfig:
                 # Domain type
 
                 if not base_type:
-                    raise RuntimeError(
+                    raise exceptions.InternalClientError(
                         'type record missing base type for domain {}'.format(
                             oid))
 
@@ -506,7 +537,7 @@ cdef class DataCodecConfig:
                 # Range type
 
                 if not range_subtype_oid:
-                    raise RuntimeError(
+                    raise exceptions.InternalClientError(
                         'type record missing base type for range {}'.format(
                             oid))
 
@@ -538,27 +569,38 @@ cdef class DataCodecConfig:
             encode_func c_encoder = NULL
             decode_func c_decoder = NULL
             uint32_t oid = pylong_as_oid(typeoid)
-
-        if xformat == PG_XFORMAT_TUPLE:
-            core_codec = get_any_core_codec(oid, format, xformat)
-            if core_codec is None:
-                raise ValueError(
-                    "{} type does not support 'tuple' exchange format".format(
-                        typename))
-            c_encoder = core_codec.c_encoder
-            c_decoder = core_codec.c_decoder
-            format = core_codec.format
+            bint codec_set = False
 
         # Clear all previous overrides (this also clears type cache).
         self.remove_python_codec(typeoid, typename, typeschema)
 
-        self._custom_type_codecs[typeoid] = \
-            Codec.new_python_codec(oid, typename, typeschema, typekind,
-                                   encoder, decoder, c_encoder, c_decoder,
-                                   format, xformat)
+        if format == PG_FORMAT_ANY:
+            formats = (PG_FORMAT_TEXT, PG_FORMAT_BINARY)
+        else:
+            formats = (format,)
+
+        for fmt in formats:
+            if xformat == PG_XFORMAT_TUPLE:
+                core_codec = get_core_codec(oid, fmt, xformat)
+                if core_codec is None:
+                    continue
+                c_encoder = core_codec.c_encoder
+                c_decoder = core_codec.c_decoder
+
+            self._custom_type_codecs[typeoid, fmt] = \
+                Codec.new_python_codec(oid, typename, typeschema, typekind,
+                                       encoder, decoder, c_encoder, c_decoder,
+                                       fmt, xformat)
+            codec_set = True
+
+        if not codec_set:
+            raise exceptions.InterfaceError(
+                "{} type does not support the 'tuple' exchange format".format(
+                    typename))
 
     def remove_python_codec(self, typeoid, typename, typeschema):
-        self._custom_type_codecs.pop(typeoid, None)
+        for fmt in (PG_FORMAT_BINARY, PG_FORMAT_TEXT):
+            self._custom_type_codecs.pop((typeoid, fmt), None)
         self.clear_type_cache()
 
     def _set_builtin_type_codec(self, typeoid, typename, typeschema, typekind,
@@ -567,16 +609,21 @@ cdef class DataCodecConfig:
             Codec codec
             Codec target_codec
             uint32_t oid = pylong_as_oid(typeoid)
-            uint32_t alias_pid
+            uint32_t alias_oid = 0
+            bint codec_set = False
 
         if format == PG_FORMAT_ANY:
             formats = (PG_FORMAT_BINARY, PG_FORMAT_TEXT)
         else:
             formats = (format,)
 
+        if isinstance(alias_to, int):
+            alias_oid = pylong_as_oid(alias_to)
+        else:
+            alias_oid = BUILTIN_TYPE_NAME_MAP.get(alias_to, 0)
+
         for format in formats:
-            if isinstance(alias_to, int):
-                alias_oid = pylong_as_oid(alias_to)
+            if alias_oid != 0:
                 target_codec = self.get_codec(alias_oid, format)
             else:
                 target_codec = get_extra_codec(alias_to, format)
@@ -590,10 +637,20 @@ cdef class DataCodecConfig:
             codec.schema = typeschema
             codec.kind = typekind
 
-            self._custom_type_codecs[typeoid] = codec
-            break
-        else:
-            raise ValueError('unknown alias target: {}'.format(alias_to))
+            self._custom_type_codecs[typeoid, format] = codec
+            codec_set = True
+
+        if not codec_set:
+            if format == PG_FORMAT_BINARY:
+                codec_str = 'binary'
+            elif format == PG_FORMAT_TEXT:
+                codec_str = 'text'
+            else:
+                codec_str = 'text or binary'
+
+            raise exceptions.InterfaceError(
+                f'cannot alias {typename} to {alias_to}: '
+                f'there is no {codec_str} codec for {alias_to}')
 
     def set_builtin_type_codec(self, typeoid, typename, typeschema, typekind,
                                alias_to, format=PG_FORMAT_ANY):
@@ -637,7 +694,7 @@ cdef class DataCodecConfig:
     cdef inline Codec get_codec(self, uint32_t oid, ServerDataFormat format):
         cdef Codec codec
 
-        codec = self.get_local_codec(oid)
+        codec = self.get_any_local_codec(oid)
         if codec is not None:
             if codec.format != format:
                 # The codec for this OID has been overridden by
@@ -656,8 +713,14 @@ cdef class DataCodecConfig:
             except KeyError:
                 return None
 
-    cdef inline Codec get_local_codec(self, uint32_t oid):
-        return self._custom_type_codecs.get(oid)
+    cdef inline Codec get_any_local_codec(self, uint32_t oid):
+        cdef Codec codec
+
+        codec = self._custom_type_codecs.get((oid, PG_FORMAT_BINARY))
+        if codec is None:
+            return self._custom_type_codecs.get((oid, PG_FORMAT_TEXT))
+        else:
+            return codec
 
 
 cdef inline Codec get_core_codec(
@@ -707,7 +770,7 @@ cdef register_core_codec(uint32_t oid,
                          ClientExchangeFormat xformat=PG_XFORMAT_OBJECT):
 
     if oid > MAXSUPPORTEDOID:
-        raise RuntimeError(
+        raise exceptions.InternalClientError(
             'cannot register core codec for OID {}: it is greater '
             'than MAXSUPPORTEDOID ({})'.format(oid, MAXSUPPORTEDOID))
 
@@ -716,7 +779,7 @@ cdef register_core_codec(uint32_t oid,
         str name
         str kind
 
-    name = TYPEMAP[oid]
+    name = BUILTIN_TYPE_OID_MAP[oid]
     kind = 'array' if oid in ARRAY_TYPES else 'scalar'
 
     codec = Codec(oid)
@@ -729,7 +792,8 @@ cdef register_core_codec(uint32_t oid,
     elif format == PG_FORMAT_TEXT:
         text_codec_map[oid * xformat] = <void*>codec
     else:
-        raise RuntimeError('invalid data format: {}'.format(format))
+        raise exceptions.InternalClientError(
+            'invalid data format: {}'.format(format))
 
 
 cdef register_extra_codec(str name,

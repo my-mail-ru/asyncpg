@@ -8,6 +8,9 @@
 from hashlib import md5 as hashlib_md5  # for MD5 authentication
 
 
+include "scram.pyx"
+
+
 cdef class CoreProtocol:
 
     def __init__(self, con_params):
@@ -17,13 +20,12 @@ cdef class CoreProtocol:
         self.password = con_params.password
         self.auth_msg = None
         self.con_params = con_params
-        self.transport = None
         self.con_status = CONNECTION_BAD
         self.state = PROTOCOL_IDLE
         self.xact_status = PQTRANS_IDLE
         self.encoding = 'utf-8'
-
-        self._skip_discard = False
+        # type of `scram` is `SCRAMAuthentcation`
+        self.scram = None
 
         # executemany support data
         self._execute_iter = None
@@ -38,33 +40,33 @@ cdef class CoreProtocol:
         # PQTRANS_INERROR = idle, within failed transaction
         return self.xact_status in (PQTRANS_INTRANS, PQTRANS_INERROR)
 
-    cdef _write(self, buf):
-        self.transport.write(memoryview(buf))
-
     cdef _read_server_messages(self):
         cdef:
             char mtype
             ProtocolState state
+            pgproto.take_message_method take_message = \
+                <pgproto.take_message_method>self.buffer.take_message
+            pgproto.get_message_type_method get_message_type= \
+                <pgproto.get_message_type_method>self.buffer.get_message_type
 
-        while self.buffer.has_message() == 1:
-            mtype = self.buffer.get_message_type()
+        while take_message(self.buffer) == 1:
+            mtype = get_message_type(self.buffer)
             state = self.state
 
             try:
                 if mtype == b'S':
                     # ParameterStatus
                     self._parse_msg_parameter_status()
-                    continue
+
                 elif mtype == b'A':
                     # NotificationResponse
                     self._parse_msg_notification()
-                    continue
+
                 elif mtype == b'N':
                     # 'N' - NoticeResponse
                     self._on_notice(self._parse_msg_error_response(False))
-                    continue
 
-                if state == PROTOCOL_AUTH:
+                elif state == PROTOCOL_AUTH:
                     self._process__auth(mtype)
 
                 elif state == PROTOCOL_PREPARE:
@@ -109,7 +111,7 @@ cdef class CoreProtocol:
                         self._parse_msg_ready_for_query()
                         self._push_result()
                     else:
-                        self.buffer.consume_message()
+                        self.buffer.discard_message()
 
                 elif state == PROTOCOL_ERROR_CONSUME:
                     # Error in protocol (on asyncpg side);
@@ -119,17 +121,24 @@ cdef class CoreProtocol:
                         # Sync point, self to push the result
                         if self.result_type != RESULT_FAILED:
                             self.result_type = RESULT_FAILED
-                            self.result = RuntimeError(
+                            self.result = apg_exc.InternalClientError(
                                 'unknown error in protocol implementation')
 
                         self._push_result()
 
                     else:
-                        self.buffer.consume_message()
+                        self.buffer.discard_message()
+
+                elif state == PROTOCOL_TERMINATING:
+                    # The connection is being terminated.
+                    # discard all messages until connection
+                    # termination.
+                    self.buffer.discard_message()
 
                 else:
                     raise apg_exc.InternalClientError(
-                        'protocol is in an unknown state {}'.format(state))
+                        f'cannot process message {chr(mtype)!r}: '
+                        f'protocol is in an unexpected state {state!r}.')
 
             except Exception as ex:
                 self.result_type = RESULT_FAILED
@@ -141,10 +150,7 @@ cdef class CoreProtocol:
                     self.state = PROTOCOL_ERROR_CONSUME
 
             finally:
-                if self._skip_discard:
-                    self._skip_discard = False
-                else:
-                    self.buffer.discard_message()
+                self.buffer.finish_message()
 
     cdef _process__auth(self, char mtype):
         if mtype == b'R':
@@ -153,7 +159,6 @@ cdef class CoreProtocol:
             if self.result_type != RESULT_OK:
                 self.con_status = CONNECTION_BAD
                 self._push_result()
-                self.transport.close()
 
             elif self.auth_msg is not None:
                 # Server wants us to send auth data, so do that.
@@ -179,15 +184,15 @@ cdef class CoreProtocol:
     cdef _process__prepare(self, char mtype):
         if mtype == b't':
             # Parameters description
-            self.result_param_desc = self.buffer.consume_message().as_bytes()
+            self.result_param_desc = self.buffer.consume_message()
 
         elif mtype == b'1':
             # ParseComplete
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
         elif mtype == b'T':
             # Row description
-            self.result_row_desc = self.buffer.consume_message().as_bytes()
+            self.result_row_desc = self.buffer.consume_message()
 
         elif mtype == b'E':
             # ErrorResponse
@@ -200,7 +205,7 @@ cdef class CoreProtocol:
 
         elif mtype == b'n':
             # NoData
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
     cdef _process__bind_execute(self, char mtype):
         if mtype == b'D':
@@ -209,7 +214,7 @@ cdef class CoreProtocol:
 
         elif mtype == b's':
             # PortalSuspended
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
         elif mtype == b'C':
             # CommandComplete
@@ -222,7 +227,7 @@ cdef class CoreProtocol:
 
         elif mtype == b'2':
             # BindComplete
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
         elif mtype == b'Z':
             # ReadyForQuery
@@ -231,7 +236,7 @@ cdef class CoreProtocol:
 
         elif mtype == b'I':
             # EmptyQueryResponse
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
     cdef _process__bind_execute_many(self, char mtype):
         cdef WriteBuffer buf
@@ -242,7 +247,7 @@ cdef class CoreProtocol:
 
         elif mtype == b's':
             # PortalSuspended
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
         elif mtype == b'C':
             # CommandComplete
@@ -254,7 +259,7 @@ cdef class CoreProtocol:
 
         elif mtype == b'2':
             # BindComplete
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
         elif mtype == b'Z':
             # ReadyForQuery
@@ -283,7 +288,7 @@ cdef class CoreProtocol:
 
         elif mtype == b'I':
             # EmptyQueryResponse
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
     cdef _process__bind(self, char mtype):
         if mtype == b'E':
@@ -292,7 +297,7 @@ cdef class CoreProtocol:
 
         elif mtype == b'2':
             # BindComplete
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
         elif mtype == b'Z':
             # ReadyForQuery
@@ -306,7 +311,7 @@ cdef class CoreProtocol:
 
         elif mtype == b'3':
             # CloseComplete
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
         elif mtype == b'Z':
             # ReadyForQuery
@@ -318,7 +323,7 @@ cdef class CoreProtocol:
             # 'D' - DataRow
             # 'I' - EmptyQueryResponse
             # 'T' - RowDescription
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
         elif mtype == b'E':
             # ErrorResponse
@@ -335,7 +340,7 @@ cdef class CoreProtocol:
 
         else:
             # We don't really care about COPY IN etc
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
     cdef _process__copy_out(self, char mtype):
         if mtype == b'E':
@@ -344,7 +349,7 @@ cdef class CoreProtocol:
         elif mtype == b'H':
             # CopyOutResponse
             self._set_state(PROTOCOL_COPY_OUT_DATA)
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
         elif mtype == b'Z':
             # ReadyForQuery
@@ -361,7 +366,7 @@ cdef class CoreProtocol:
 
         elif mtype == b'c':
             # CopyDone
-            self.buffer.consume_message()
+            self.buffer.discard_message()
             self._set_state(PROTOCOL_COPY_OUT_DONE)
 
         elif mtype == b'C':
@@ -380,7 +385,7 @@ cdef class CoreProtocol:
         elif mtype == b'G':
             # CopyInResponse
             self._set_state(PROTOCOL_COPY_IN_DATA)
-            self.buffer.consume_message()
+            self.buffer.discard_message()
 
         elif mtype == b'Z':
             # ReadyForQuery
@@ -409,7 +414,7 @@ cdef class CoreProtocol:
         if cbuf != NULL and cbuf_len > 0:
             msg = cpython.PyBytes_FromStringAndSize(cbuf, cbuf_len - 1)
         else:
-            msg = self.buffer.read_cstr()
+            msg = self.buffer.read_null_str()
         self.result_status_msg = msg
 
     cdef _parse_copy_data_msgs(self):
@@ -418,8 +423,6 @@ cdef class CoreProtocol:
 
         self.result = buf.consume_messages(b'd')
 
-        self._skip_discard = True
-
         # By this point we have consumed all CopyData messages
         # in the inbound buffer.  If there are no messages left
         # in the buffer, we need to push the accumulated data
@@ -427,9 +430,13 @@ cdef class CoreProtocol:
         # batch.  If there _are_ non-CopyData messages left,
         # we must not push the result here and let the
         # _process__copy_out_data subprotocol do the job.
-        if not buf.has_message():
+        if not buf.take_message():
             self._on_result()
             self.result = None
+        else:
+            # If there is a message in the buffer, put it back to
+            # be processed by the next protocol iteration.
+            buf.put_message()
 
     cdef _write_copy_data_msg(self, object data):
         cdef:
@@ -437,10 +444,11 @@ cdef class CoreProtocol:
             object mview
             Py_buffer *pybuf
 
-        mview = PyMemoryView_GetContiguous(data, cpython.PyBUF_SIMPLE, b'C')
+        mview = cpythonx.PyMemoryView_GetContiguous(
+            data, cpython.PyBUF_READ, b'C')
 
         try:
-            pybuf = PyMemoryView_GET_BUFFER(mview)
+            pybuf = cpythonx.PyMemoryView_GET_BUFFER(mview)
 
             buf = WriteBuffer.new_message(b'd')
             buf.write_cstr(<const char *>pybuf.buf, pybuf.len)
@@ -471,69 +479,73 @@ cdef class CoreProtocol:
         cdef:
             ReadBuffer buf = self.buffer
             list rows
+
             decode_row_method decoder = <decode_row_method>self._decode_row
+            pgproto.try_consume_message_method try_consume_message = \
+                <pgproto.try_consume_message_method>buf.try_consume_message
+            pgproto.take_message_type_method take_message_type = \
+                <pgproto.take_message_type_method>buf.take_message_type
 
             const char* cbuf
             ssize_t cbuf_len
             object row
-            Memory mem
+            bytes mem
 
-        if ASYNCPG_DEBUG:
+        if PG_DEBUG:
             if buf.get_message_type() != b'D':
                 raise apg_exc.InternalClientError(
                     '_parse_data_msgs: first message is not "D"')
 
         if self._discard_data:
-            while True:
-                buf.consume_message()
-                if not buf.has_message() or buf.get_message_type() != b'D':
-                    self._skip_discard = True
-                    return
+            while take_message_type(buf, b'D'):
+                buf.discard_message()
+            return
 
-        if ASYNCPG_DEBUG:
+        if PG_DEBUG:
             if type(self.result) is not list:
                 raise apg_exc.InternalClientError(
                     '_parse_data_msgs: result is not a list, but {!r}'.
                     format(self.result))
 
         rows = self.result
-        while True:
-            cbuf = buf.try_consume_message(&cbuf_len)
+        while take_message_type(buf, b'D'):
+            cbuf = try_consume_message(buf, &cbuf_len)
             if cbuf != NULL:
                 row = decoder(self, cbuf, cbuf_len)
             else:
                 mem = buf.consume_message()
-                row = decoder(self, mem.buf, mem.length)
+                row = decoder(
+                    self,
+                    cpython.PyBytes_AS_STRING(mem),
+                    cpython.PyBytes_GET_SIZE(mem))
 
             cpython.PyList_Append(rows, row)
-
-            if not buf.has_message() or buf.get_message_type() != b'D':
-                self._skip_discard = True
-                return
 
     cdef _parse_msg_backend_key_data(self):
         self.backend_pid = self.buffer.read_int32()
         self.backend_secret = self.buffer.read_int32()
 
     cdef _parse_msg_parameter_status(self):
-        name = self.buffer.read_cstr()
+        name = self.buffer.read_null_str()
         name = name.decode(self.encoding)
 
-        val = self.buffer.read_cstr()
+        val = self.buffer.read_null_str()
         val = val.decode(self.encoding)
 
         self._set_server_parameter(name, val)
 
     cdef _parse_msg_notification(self):
         pid = self.buffer.read_int32()
-        channel = self.buffer.read_cstr().decode(self.encoding)
-        payload = self.buffer.read_cstr().decode(self.encoding)
+        channel = self.buffer.read_null_str().decode(self.encoding)
+        payload = self.buffer.read_null_str().decode(self.encoding)
         self._on_notification(pid, channel, payload)
 
     cdef _parse_msg_authentication(self):
         cdef:
             int32_t status
             bytes md5_salt
+            list sasl_auth_methods
+            list unsupported_sasl_auth_methods
 
         status = self.buffer.read_int32()
 
@@ -549,9 +561,60 @@ cdef class CoreProtocol:
         elif status == AUTH_REQUIRED_PASSWORDMD5:
             # AuthenticationMD5Password
             # Note: MD5 salt is passed as a four-byte sequence
-            md5_salt = cpython.PyBytes_FromStringAndSize(
-                self.buffer.read_bytes(4), 4)
+            md5_salt = self.buffer.read_bytes(4)
             self.auth_msg = self._auth_password_message_md5(md5_salt)
+
+        elif status == AUTH_REQUIRED_SASL:
+            # AuthenticationSASL
+            # This requires making additional requests to the server in order
+            # to follow the SCRAM protocol defined in RFC 5802.
+            # get the SASL authentication methods that the server is providing
+            sasl_auth_methods = []
+            unsupported_sasl_auth_methods = []
+            # determine if the advertised authentication methods are supported,
+            # and if so, add them to the list
+            auth_method = self.buffer.read_null_str()
+            while auth_method:
+                if auth_method in SCRAMAuthentication.AUTHENTICATION_METHODS:
+                    sasl_auth_methods.append(auth_method)
+                else:
+                    unsupported_sasl_auth_methods.append(auth_method)
+                auth_method = self.buffer.read_null_str()
+
+            # if none of the advertised authentication methods are supported,
+            # raise an error
+            # otherwise, initialize the SASL authentication exchange
+            if not sasl_auth_methods:
+                unsupported_sasl_auth_methods = [m.decode("ascii")
+                    for m in unsupported_sasl_auth_methods]
+                self.result_type = RESULT_FAILED
+                self.result = apg_exc.InterfaceError(
+                    'unsupported SASL Authentication methods requested by the '
+                    'server: {!r}'.format(
+                        ", ".join(unsupported_sasl_auth_methods)))
+            else:
+                self.auth_msg = self._auth_password_message_sasl_initial(
+                    sasl_auth_methods)
+
+        elif status == AUTH_SASL_CONTINUE:
+            # AUTH_SASL_CONTINUE
+            # this requeires sending the second part of the SASL exchange, where
+            # the client parses information back from the server and determines
+            # if this is valid.
+            # The client builds a challenge response to the server
+            server_response = self.buffer.consume_message()
+            self.auth_msg = self._auth_password_message_sasl_continue(
+                server_response)
+
+        elif status == AUTH_SASL_FINAL:
+            # AUTH_SASL_FINAL
+            server_response = self.buffer.consume_message()
+            if not self.scram.verify_server_final_message(server_response):
+                self.result_type = RESULT_FAILED
+                self.result = apg_exc.InterfaceError(
+                    'could not verify server signature for '
+                    'SCRAM authentciation: scram-sha-256',
+                )
 
         elif status in (AUTH_REQUIRED_KERBEROS, AUTH_REQUIRED_SCMCRED,
                         AUTH_REQUIRED_GSS, AUTH_REQUIRED_GSS_CONTINUE,
@@ -567,7 +630,8 @@ cdef class CoreProtocol:
                 'unsupported authentication method requested by the '
                 'server: {}'.format(status))
 
-        self.buffer.consume_message()
+        if status not in [AUTH_SASL_CONTINUE, AUTH_SASL_FINAL]:
+            self.buffer.discard_message()
 
     cdef _auth_password_message_cleartext(self):
         cdef:
@@ -595,6 +659,34 @@ cdef class CoreProtocol:
 
         return msg
 
+    cdef _auth_password_message_sasl_initial(self, list sasl_auth_methods):
+        cdef:
+            WriteBuffer msg
+
+        # use the first supported advertized mechanism
+        self.scram = SCRAMAuthentication(sasl_auth_methods[0])
+        # this involves a call and response with the server
+        msg = WriteBuffer.new_message(b'p')
+        msg.write_bytes(self.scram.create_client_first_message(self.user or ''))
+        msg.end_message()
+
+        return msg
+
+    cdef _auth_password_message_sasl_continue(self, bytes server_response):
+        cdef:
+            WriteBuffer msg
+
+        # determine if there is a valid server response
+        self.scram.parse_server_first_message(server_response)
+        # this involves a call and response with the server
+        msg = WriteBuffer.new_message(b'p')
+        client_final_message = self.scram.create_client_final_message(
+            self.password or '')
+        msg.write_bytes(client_final_message)
+        msg.end_message()
+
+        return msg
+
     cdef _parse_msg_ready_for_query(self):
         cdef char status = self.buffer.read_byte()
 
@@ -618,7 +710,7 @@ cdef class CoreProtocol:
             if code == 0:
                 break
 
-            message = self.buffer.read_cstr()
+            message = self.buffer.read_null_str()
 
             parsed[chr(code)] = message.decode()
 
@@ -651,8 +743,7 @@ cdef class CoreProtocol:
                     'cannot switch to "idle" state; '
                     'protocol is in the "failed" state')
             elif self.state == PROTOCOL_IDLE:
-                raise apg_exc.InternalClientError(
-                    'protocol is already in the "idle" state')
+                pass
             else:
                 self.state = new_state
 
@@ -661,6 +752,9 @@ cdef class CoreProtocol:
 
         elif new_state == PROTOCOL_CANCELLED:
             self.state = PROTOCOL_CANCELLED
+
+        elif new_state == PROTOCOL_TERMINATING:
+            self.state = PROTOCOL_TERMINATING
 
         else:
             if self.state == PROTOCOL_IDLE:
@@ -941,9 +1035,13 @@ cdef class CoreProtocol:
     cdef _terminate(self):
         cdef WriteBuffer buf
         self._ensure_connected()
+        self._set_state(PROTOCOL_TERMINATING)
         buf = WriteBuffer.new_message(b'X')
         buf.end_message()
         self._write(buf)
+
+    cdef _write(self, buf):
+        raise NotImplementedError
 
     cdef _decode_row(self, const char* buf, ssize_t buf_len):
         pass
@@ -962,35 +1060,6 @@ cdef class CoreProtocol:
 
     cdef _on_connection_lost(self, exc):
         pass
-
-    # asyncio callbacks:
-
-    def data_received(self, data):
-        self.buffer.feed_data(data)
-        self._read_server_messages()
-
-    def connection_made(self, transport):
-        self.transport = transport
-
-        sock = transport.get_extra_info('socket')
-        if (sock is not None and
-              (not hasattr(socket, 'AF_UNIX')
-               or sock.family != socket.AF_UNIX)):
-            sock.setsockopt(socket.IPPROTO_TCP,
-                            socket.TCP_NODELAY, 1)
-
-        try:
-            self._connect()
-        except Exception as ex:
-            transport.abort()
-            self.con_status = CONNECTION_BAD
-            self._set_state(PROTOCOL_FAILED)
-            self._on_error(ex)
-
-    def connection_lost(self, exc):
-        self.con_status = CONNECTION_BAD
-        self._set_state(PROTOCOL_FAILED)
-        self._on_connection_lost(exc)
 
 
 cdef bytes SYNC_MESSAGE = bytes(WriteBuffer.new_message(b'S').end_message())

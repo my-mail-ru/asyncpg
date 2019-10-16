@@ -12,7 +12,7 @@ import textwrap
 
 __all__ = ('PostgresError', 'FatalPostgresError', 'UnknownPostgresError',
            'InterfaceError', 'InterfaceWarning', 'PostgresLogMessage',
-           'InternalClientError', 'OutdatedSchemaCacheError')
+           'InternalClientError', 'OutdatedSchemaCacheError', 'ProtocolError')
 
 
 def _is_asyncpg_class(cls):
@@ -214,7 +214,11 @@ class InterfaceWarning(InterfaceMessage, UserWarning):
 
 
 class InternalClientError(Exception):
-    pass
+    """All unexpected errors not classified otherwise."""
+
+
+class ProtocolError(InternalClientError):
+    """Unexpected condition in the handling of PostgreSQL protocol input."""
 
 
 class OutdatedSchemaCacheError(InternalClientError):

@@ -5,7 +5,11 @@
 # the Apache 2.0 License: http://www.apache.org/licenses/LICENSE-2.0
 
 
-from collections.abc import Iterable as IterableABC, Sized as SizedABC
+from collections.abc import (Iterable as IterableABC,
+                             Mapping as MappingABC,
+                             Sized as SizedABC)
+
+from asyncpg import exceptions
 
 
 DEF ARRAY_MAXDIM = 6  # defined in postgresql/src/includes/c.h
@@ -21,20 +25,21 @@ ctypedef object (*encode_func_ex)(ConnectionSettings settings,
 
 
 ctypedef object (*decode_func_ex)(ConnectionSettings settings,
-                                  FastReadBuffer buf,
+                                  FRBuffer *buf,
                                   const void *arg)
 
 
 cdef inline bint _is_trivial_container(object obj):
     return cpython.PyUnicode_Check(obj) or cpython.PyBytes_Check(obj) or \
-            PyByteArray_Check(obj) or PyMemoryView_Check(obj)
+            cpythonx.PyByteArray_Check(obj) or cpythonx.PyMemoryView_Check(obj)
 
 
 cdef inline _is_array_iterable(object obj):
     return (
         isinstance(obj, IterableABC) and
         isinstance(obj, SizedABC) and
-        not _is_trivial_container(obj)
+        not _is_trivial_container(obj) and
+        not isinstance(obj, MappingABC)
     )
 
 
@@ -266,17 +271,17 @@ cdef inline textarray_encode(ConnectionSettings settings, WriteBuffer buf,
     buf.write_buffer(array_data)
 
 
-cdef inline array_decode(ConnectionSettings settings, FastReadBuffer buf,
+cdef inline array_decode(ConnectionSettings settings, FRBuffer *buf,
                          decode_func_ex decoder, const void *decoder_arg):
     cdef:
-        int32_t ndims = hton.unpack_int32(buf.read(4))
-        int32_t flags = hton.unpack_int32(buf.read(4))
-        uint32_t elem_oid = <uint32_t>hton.unpack_int32(buf.read(4))
+        int32_t ndims = hton.unpack_int32(frb_read(buf, 4))
+        int32_t flags = hton.unpack_int32(frb_read(buf, 4))
+        uint32_t elem_oid = <uint32_t>hton.unpack_int32(frb_read(buf, 4))
         list result
         int i
         int32_t elem_len
         int32_t elem_count = 1
-        FastReadBuffer elem_buf = FastReadBuffer.new()
+        FRBuffer elem_buf
         int32_t dims[ARRAY_MAXDIM]
         Codec elem_codec
 
@@ -285,14 +290,14 @@ cdef inline array_decode(ConnectionSettings settings, FastReadBuffer buf,
         return result
 
     if ndims > ARRAY_MAXDIM:
-        raise RuntimeError(
+        raise exceptions.ProtocolError(
             'number of array dimensions ({}) exceed the maximum expected ({})'.
             format(ndims, ARRAY_MAXDIM))
 
     for i in range(ndims):
-        dims[i] = hton.unpack_int32(buf.read(4))
+        dims[i] = hton.unpack_int32(frb_read(buf, 4))
         # Ignore the lower bound information
-        buf.read(4)
+        frb_read(buf, 4)
 
     if ndims == 1:
         # Fast path for flat arrays
@@ -300,12 +305,12 @@ cdef inline array_decode(ConnectionSettings settings, FastReadBuffer buf,
         result = cpython.PyList_New(elem_count)
 
         for i in range(elem_count):
-            elem_len = hton.unpack_int32(buf.read(4))
+            elem_len = hton.unpack_int32(frb_read(buf, 4))
             if elem_len == -1:
                 elem = None
             else:
-                elem_buf.slice_from(buf, elem_len)
-                elem = decoder(settings, elem_buf, decoder_arg)
+                frb_slice_from(&elem_buf, buf, elem_len)
+                elem = decoder(settings, &elem_buf, decoder_arg)
 
             cpython.Py_INCREF(elem)
             cpython.PyList_SET_ITEM(result, i, elem)
@@ -313,17 +318,17 @@ cdef inline array_decode(ConnectionSettings settings, FastReadBuffer buf,
     else:
         result = _nested_array_decode(settings, buf,
                                       decoder, decoder_arg, ndims, dims,
-                                      elem_buf)
+                                      &elem_buf)
 
     return result
 
 
 cdef _nested_array_decode(ConnectionSettings settings,
-                          FastReadBuffer buf,
+                          FRBuffer *buf,
                           decode_func_ex decoder,
                           const void *decoder_arg,
                           int32_t ndims, int32_t *dims,
-                          FastReadBuffer elem_buf):
+                          FRBuffer *elem_buf):
 
     cdef:
         int32_t elem_len
@@ -335,9 +340,10 @@ cdef _nested_array_decode(ConnectionSettings settings,
         # An array of current positions at each array level.
         int32_t indexes[ARRAY_MAXDIM]
 
-    if ASYNCPG_DEBUG:
+    if PG_DEBUG:
         if ndims <= 0:
-            raise RuntimeError('unexpected ndims value: {}'.format(ndims))
+            raise exceptions.ProtocolError(
+                'unexpected ndims value: {}'.format(ndims))
 
     for i in range(ndims):
         array_len *= dims[i]
@@ -345,12 +351,12 @@ cdef _nested_array_decode(ConnectionSettings settings,
 
     for i in range(array_len):
         # Decode the element.
-        elem_len = hton.unpack_int32(buf.read(4))
+        elem_len = hton.unpack_int32(frb_read(buf, 4))
         if elem_len == -1:
             elem = None
         else:
             elem = decoder(settings,
-                           elem_buf.slice_from(buf, elem_len),
+                           frb_slice_from(elem_buf, buf, elem_len),
                            decoder_arg)
 
         # Take an explicit reference for PyList_SET_ITEM in the below
@@ -393,7 +399,7 @@ cdef _nested_array_decode(ConnectionSettings settings,
     return stride
 
 
-cdef textarray_decode(ConnectionSettings settings, FastReadBuffer buf,
+cdef textarray_decode(ConnectionSettings settings, FRBuffer *buf,
                       decode_func_ex decoder, const void *decoder_arg,
                       Py_UCS4 typdelim):
     cdef:
@@ -402,17 +408,17 @@ cdef textarray_decode(ConnectionSettings settings, FastReadBuffer buf,
 
     # Make a copy of array data since we will be mutating it for
     # the purposes of element decoding.
-    s = text_decode(settings, buf)
-    array_text = PyUnicode_AsUCS4Copy(s)
+    s = pgproto.text_decode(settings, buf)
+    array_text = cpythonx.PyUnicode_AsUCS4Copy(s)
 
     try:
         return _textarray_decode(
             settings, array_text, decoder, decoder_arg, typdelim)
     except ValueError as e:
-        raise ValueError(
+        raise exceptions.ProtocolError(
             'malformed array literal {!r}: {}'.format(s, e.args[0]))
     finally:
-        PyMem_Free(array_text)
+        cpython.PyMem_Free(array_text)
 
 
 cdef _textarray_decode(ConnectionSettings settings,
@@ -449,7 +455,7 @@ cdef _textarray_decode(ConnectionSettings settings,
         int i
         object item
         str item_text
-        FastReadBuffer item_buf = FastReadBuffer.new()
+        FRBuffer item_buf
         char *pg_item_str
         ssize_t pg_item_len
 
@@ -624,18 +630,17 @@ cdef _textarray_decode(ConnectionSettings settings,
         else:
             # XXX: find a way to avoid the redundant encode/decode
             # cycle here.
-            item_text = PyUnicode_FromKindAndData(
-                PyUnicode_4BYTE_KIND,
+            item_text = cpythonx.PyUnicode_FromKindAndData(
+                cpythonx.PyUnicode_4BYTE_KIND,
                 <void *>item_start,
                 item_end - item_start)
 
             # Prepare the element buffer and call the text decoder
             # for the element type.
-            as_pg_string_and_size(
+            pgproto.as_pg_string_and_size(
                 settings, item_text, &pg_item_str, &pg_item_len)
-            item_buf.buf = pg_item_str
-            item_buf.len = pg_item_len
-            item = decoder(settings, item_buf, decoder_arg)
+            frb_init(&item_buf, pg_item_str, pg_item_len)
+            item = decoder(settings, &item_buf, decoder_arg)
 
         # Place the decoded element in the array.
         cpython.Py_INCREF(item)
@@ -806,12 +811,12 @@ cdef _infer_array_dims(const Py_UCS4 *array_text,
 
 cdef uint4_encode_ex(ConnectionSettings settings, WriteBuffer buf, object obj,
                      const void *arg):
-    return uint4_encode(settings, buf, obj)
+    return pgproto.uint4_encode(settings, buf, obj)
 
 
-cdef uint4_decode_ex(ConnectionSettings settings, FastReadBuffer buf,
+cdef uint4_decode_ex(ConnectionSettings settings, FRBuffer *buf,
                      const void *arg):
-    return uint4_decode(settings, buf)
+    return pgproto.uint4_decode(settings, buf)
 
 
 cdef arrayoid_encode(ConnectionSettings settings, WriteBuffer buf, items):
@@ -819,18 +824,18 @@ cdef arrayoid_encode(ConnectionSettings settings, WriteBuffer buf, items):
                  <encode_func_ex>&uint4_encode_ex, NULL)
 
 
-cdef arrayoid_decode(ConnectionSettings settings, FastReadBuffer buf):
+cdef arrayoid_decode(ConnectionSettings settings, FRBuffer *buf):
     return array_decode(settings, buf, <decode_func_ex>&uint4_decode_ex, NULL)
 
 
 cdef text_encode_ex(ConnectionSettings settings, WriteBuffer buf, object obj,
                     const void *arg):
-    return text_encode(settings, buf, obj)
+    return pgproto.text_encode(settings, buf, obj)
 
 
-cdef text_decode_ex(ConnectionSettings settings, FastReadBuffer buf,
+cdef text_decode_ex(ConnectionSettings settings, FRBuffer *buf,
                     const void *arg):
-    return text_decode(settings, buf)
+    return pgproto.text_decode(settings, buf)
 
 
 cdef arraytext_encode(ConnectionSettings settings, WriteBuffer buf, items):
@@ -838,14 +843,15 @@ cdef arraytext_encode(ConnectionSettings settings, WriteBuffer buf, items):
                  <encode_func_ex>&text_encode_ex, NULL)
 
 
-cdef arraytext_decode(ConnectionSettings settings, FastReadBuffer buf):
+cdef arraytext_decode(ConnectionSettings settings, FRBuffer *buf):
     return array_decode(settings, buf, <decode_func_ex>&text_decode_ex, NULL)
 
 
-cdef anyarray_decode(ConnectionSettings settings, FastReadBuffer buf):
+cdef anyarray_decode(ConnectionSettings settings, FRBuffer *buf):
     # Instances of anyarray (or any other polymorphic pseudotype) are
     # never supposed to be returned from actual queries.
-    raise RuntimeError('unexpected instance of \'anyarray\' type')
+    raise exceptions.ProtocolError(
+        'unexpected instance of \'anyarray\' type')
 
 
 cdef init_array_codecs():

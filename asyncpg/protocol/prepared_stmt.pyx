@@ -22,7 +22,6 @@ cdef class PreparedStatementState:
         self.need_reprepare = False
         self.closed = False
         self.refs = 0
-        self.buffer = FastReadBuffer.new()
 
     def _get_parameters(self):
         cdef Codec codec
@@ -31,7 +30,8 @@ cdef class PreparedStatementState:
         for oid in self.parameters_desc:
             codec = self.settings.get_data_codec(oid)
             if codec is None:
-                raise RuntimeError
+                raise exceptions.InternalClientError(
+                    'missing codec information for OID {}'.format(oid))
             result.append(apg_types.Type(
                 oid, codec.name, codec.kind, codec.schema))
 
@@ -50,7 +50,8 @@ cdef class PreparedStatementState:
 
             codec = self.settings.get_data_codec(oid)
             if codec is None:
-                raise RuntimeError
+                raise exceptions.InternalClientError(
+                    'missing codec information for OID {}'.format(oid))
 
             name = name.decode(self.settings._encoding)
 
@@ -200,7 +201,8 @@ cdef class PreparedStatementState:
             oid = row[3]
             codec = self.settings.get_data_codec(oid)
             if codec is None or not codec.has_decoder():
-                raise RuntimeError('no decoder for OID {}'.format(oid))
+                raise exceptions.InternalClientError(
+                    'no decoder for OID {}'.format(oid))
             if not codec.is_binary():
                 self.have_text_cols = True
 
@@ -224,7 +226,8 @@ cdef class PreparedStatementState:
             p_oid = self.parameters_desc[i]
             codec = self.settings.get_data_codec(p_oid)
             if codec is None or not codec.has_encoder():
-                raise RuntimeError('no encoder for OID {}'.format(p_oid))
+                raise exceptions.InternalClientError(
+                    'no encoder for OID {}'.format(p_oid))
             if codec.type not in {}:
                 self.have_text_args = True
 
@@ -249,28 +252,22 @@ cdef class PreparedStatementState:
             tuple rows_codecs = self.rows_codecs
             ConnectionSettings settings = self.settings
             int32_t i
-            FastReadBuffer rbuf = self.buffer
+            FRBuffer rbuf
             ssize_t bl
 
-        rbuf.buf = cbuf
-        rbuf.len = buf_len
+        frb_init(&rbuf, cbuf, buf_len)
 
-        fnum = hton.unpack_int16(rbuf.read(2))
+        fnum = hton.unpack_int16(frb_read(&rbuf, 2))
 
         if fnum != self.cols_num:
-            raise RuntimeError(
-                'number of columns in result ({}) is '
+            raise exceptions.ProtocolError(
+                'the number of columns in the result row ({}) is '
                 'different from what was described ({})'.format(
                     fnum, self.cols_num))
 
-        if rows_codecs is None or len(rows_codecs) < fnum:
-            if fnum > 0:
-                # It's OK to have no rows_codecs for empty records
-                raise RuntimeError('invalid rows_codecs')
-
         dec_row = record.ApgRecord_New(self.cols_desc, fnum)
         for i in range(fnum):
-            flen = hton.unpack_int32(rbuf.read(4))
+            flen = hton.unpack_int32(frb_read(&rbuf, 4))
 
             if flen == -1:
                 val = None
@@ -278,25 +275,24 @@ cdef class PreparedStatementState:
                 # Clamp buffer size to that of the reported field length
                 # to make sure that codecs can rely on read_all() working
                 # properly.
-                bl = rbuf.len
+                bl = frb_get_len(&rbuf)
                 if flen > bl:
-                    # Check for overflow
-                    rbuf._raise_ins_err(flen, bl)
-                rbuf.len = flen
+                    frb_check(&rbuf, flen)
+                frb_set_len(&rbuf, flen)
                 codec = <Codec>cpython.PyTuple_GET_ITEM(rows_codecs, i)
-                val = codec.decode(settings, rbuf)
-                if rbuf.len != 0:
+                val = codec.decode(settings, &rbuf)
+                if frb_get_len(&rbuf) != 0:
                     raise BufferError(
                         'unexpected trailing {} bytes in buffer'.format(
-                            rbuf.len))
-                rbuf.len = bl - flen
+                            frb_get_len(&rbuf)))
+                frb_set_len(&rbuf, bl - flen)
 
             cpython.Py_INCREF(val)
             record.ApgRecord_SET_ITEM(dec_row, i, val)
 
-        if rbuf.len != 0:
+        if frb_get_len(&rbuf) != 0:
             raise BufferError('unexpected trailing {} bytes in buffer'.format(
-                rbuf.len))
+                frb_get_len(&rbuf)))
 
         return dec_row
 
@@ -339,7 +335,7 @@ cdef _decode_row_desc(object desc):
     result = []
 
     for i from 0 <= i < nfields:
-        f_name = reader.read_cstr()
+        f_name = reader.read_null_str()
         f_table_oid = <uint32_t>reader.read_int32()
         f_column_num = reader.read_int16()
         f_dt_oid = <uint32_t>reader.read_int32()

@@ -169,7 +169,11 @@ type_samples = [
         {'textinput': 'infinity', 'output': infinity_datetime},
         {'textinput': '-infinity', 'output': negative_infinity_datetime},
         {'input': datetime.date(2000, 1, 1),
-         'output': datetime.datetime(2000, 1, 1)}
+         'output': datetime.datetime(2000, 1, 1)},
+        {'textinput': '1970-01-01 20:31:23.648',
+         'output': datetime.datetime(1970, 1, 1, 20, 31, 23, 648000)},
+        {'input': datetime.datetime(1970, 1, 1, 20, 31, 23, 648000),
+         'textoutput': '1970-01-01 20:31:23.648'},
     ]),
     ('date', 'date', [
         datetime.date(3000, 5, 20),
@@ -215,12 +219,29 @@ type_samples = [
         datetime.time(22, 30, 0, tzinfo=_timezone(0)),
     ]),
     ('interval', 'interval', [
-        # no months :(
         datetime.timedelta(40, 10, 1234),
         datetime.timedelta(0, 0, 4321),
         datetime.timedelta(0, 0),
         datetime.timedelta(-100, 0),
         datetime.timedelta(-100, -400),
+        {
+            'textinput': '-2 years -11 months -10 days '
+                         '-2 hours -800 milliseconds',
+            'output': datetime.timedelta(
+                days=(-2 * 365) + (-11 * 30) - 10,
+                seconds=(-2 * 3600),
+                milliseconds=-800
+            ),
+        },
+        {
+            'query': 'SELECT justify_hours($1::interval)::text',
+            'input': datetime.timedelta(
+                days=(-2 * 365) + (-11 * 30) - 10,
+                seconds=(-2 * 3600),
+                milliseconds=-800
+            ),
+            'textoutput': '-1070 days -02:00:00.8',
+        },
     ]),
     ('uuid', 'uuid', [
         uuid.UUID('38a4ff5a-3a56-11e6-a6c2-c8f73323c6d4'),
@@ -458,6 +479,9 @@ class TestCodecs(tb.ConnectedTestCase):
                             stmt = text_out
                         else:
                             outputval = sample['output']
+
+                        if sample.get('query'):
+                            stmt = await self.con.prepare(sample['query'])
                     else:
                         inputval = outputval = sample
 
@@ -487,9 +511,9 @@ class TestCodecs(tb.ConnectedTestCase):
             self.assertEqual(at[0].type.name, intname)
 
     async def test_all_builtin_types_handled(self):
-        from asyncpg.protocol.protocol import TYPEMAP
+        from asyncpg.protocol.protocol import BUILTIN_TYPE_OID_MAP
 
-        for oid, typename in TYPEMAP.items():
+        for oid, typename in BUILTIN_TYPE_OID_MAP.items():
             codec = self.con.get_settings().get_data_codec(oid)
             self.assertIsNotNone(
                 codec,
@@ -512,6 +536,20 @@ class TestCodecs(tb.ConnectedTestCase):
             len(sanitized_bs) // 8 + (1 if len(sanitized_bs) % 8 else 0)
 
         self.assertEqual(len(bits.bytes), expected_bytelen)
+
+        little, big = bits.to_int('little'), bits.to_int('big')
+        self.assertEqual(bits.from_int(little, len(bits), 'little'), bits)
+        self.assertEqual(bits.from_int(big, len(bits), 'big'), bits)
+
+        naive_little = 0
+        for i, c in enumerate(sanitized_bs):
+            naive_little |= int(c) << i
+        naive_big = 0
+        for c in sanitized_bs:
+            naive_big = (naive_big << 1) | int(c)
+
+        self.assertEqual(little, naive_little)
+        self.assertEqual(big, naive_big)
 
     async def test_interval(self):
         res = await self.con.fetchval("SELECT '5 years'::interval")
@@ -851,6 +889,27 @@ class TestCodecs(tb.ConnectedTestCase):
                 SELECT $1::test_composite
             ''', res)
 
+            # composite input as a mapping
+            res = await self.con.fetchval('''
+                SELECT $1::test_composite
+            ''', {'b': 'foo', 'a': 1, 'c': [1, 2, 3]})
+
+            self.assertEqual(res, (1, 'foo', [1, 2, 3]))
+
+            # Test None padding
+            res = await self.con.fetchval('''
+                SELECT $1::test_composite
+            ''', {'a': 1})
+
+            self.assertEqual(res, (1, None, None))
+
+            with self.assertRaisesRegex(
+                    asyncpg.DataError,
+                    "'bad' is not a valid element"):
+                await self.con.fetchval(
+                    "SELECT $1::test_composite",
+                    {'bad': 'foo'})
+
         finally:
             await self.con.execute('DROP TYPE test_composite')
 
@@ -941,7 +1000,9 @@ class TestCodecs(tb.ConnectedTestCase):
     async def test_extra_codec_alias(self):
         """Test encoding/decoding of a builtin non-pg_catalog codec."""
         await self.con.execute('''
-            CREATE EXTENSION IF NOT EXISTS hstore
+            CREATE DOMAIN my_dec_t AS decimal;
+            CREATE EXTENSION IF NOT EXISTS hstore;
+            CREATE TYPE rec_t AS ( i my_dec_t, h hstore );
         ''')
 
         try:
@@ -973,9 +1034,40 @@ class TestCodecs(tb.ConnectedTestCase):
                     SELECT $1::hstore AS result
                 ''', {None: '1'})
 
+            await self.con.set_builtin_type_codec(
+                'my_dec_t', codec_name='decimal')
+
+            res = await self.con.fetchval('''
+                SELECT $1::my_dec_t AS result
+            ''', 44)
+
+            self.assertEqual(res, 44)
+
+            # Both my_dec_t and hstore are decoded in binary
+            res = await self.con.fetchval('''
+                SELECT ($1::my_dec_t, 'a=>1'::hstore)::rec_t AS result
+            ''', 44)
+
+            self.assertEqual(res, (44, {'a': '1'}))
+
+            # Now, declare only the text format for my_dec_t
+            await self.con.reset_type_codec('my_dec_t')
+            await self.con.set_builtin_type_codec(
+                'my_dec_t', codec_name='decimal', format='text')
+
+            # This should fail, as there is no binary codec for
+            # my_dec_t and text decoding of composites is not
+            # implemented.
+            with self.assertRaises(NotImplementedError):
+                res = await self.con.fetchval('''
+                    SELECT ($1::my_dec_t, 'a=>1'::hstore)::rec_t AS result
+                ''', 44)
+
         finally:
             await self.con.execute('''
-                DROP EXTENSION hstore
+                DROP TYPE rec_t;
+                DROP EXTENSION hstore;
+                DROP DOMAIN my_dec_t;
             ''')
 
     async def test_custom_codec_text(self):
@@ -1589,6 +1681,45 @@ class TestCodecs(tb.ConnectedTestCase):
                 DROP TYPE enum_t;
             ''')
 
+    async def test_enum_in_composite(self):
+        await self.con.execute('''
+            CREATE TYPE enum_t AS ENUM ('abc', 'def', 'ghi');
+            CREATE TYPE composite_w_enum AS (a int, b enum_t);
+        ''')
+
+        try:
+            result = await self.con.fetchval('''
+                SELECT ROW(1, 'def'::enum_t)::composite_w_enum
+            ''')
+            self.assertEqual(set(result.items()), {('a', 1), ('b', 'def')})
+
+        finally:
+            await self.con.execute('''
+                DROP TYPE composite_w_enum;
+                DROP TYPE enum_t;
+            ''')
+
+    async def test_enum_function_return(self):
+        await self.con.execute('''
+            CREATE TYPE enum_t AS ENUM ('abc', 'def', 'ghi');
+            CREATE FUNCTION return_enum() RETURNS enum_t
+            LANGUAGE plpgsql AS $$
+            BEGIN
+                RETURN 'abc'::enum_t;
+            END;
+            $$;
+        ''')
+
+        try:
+            result = await self.con.fetchval('''SELECT return_enum()''')
+            self.assertEqual(result, 'abc')
+
+        finally:
+            await self.con.execute('''
+                DROP FUNCTION return_enum();
+                DROP TYPE enum_t;
+            ''')
+
     async def test_no_result(self):
         st = await self.con.prepare('rollback')
         self.assertTupleEqual(st.get_attributes(), ())
@@ -1596,10 +1727,12 @@ class TestCodecs(tb.ConnectedTestCase):
 
 @unittest.skipIf(os.environ.get('PGHOST'), 'using remote cluster for testing')
 class TestCodecsLargeOIDs(tb.ConnectedTestCase):
+    LARGE_OID = 2147483648
+
     @classmethod
     def setup_cluster(cls):
         cls.cluster = cls.new_cluster(pg_cluster.TempCluster)
-        cls.cluster.reset_wal(oid=2147483648)
+        cls.cluster.reset_wal(oid=cls.LARGE_OID)
         cls.start_cluster(cls.cluster)
 
     async def test_custom_codec_large_oid(self):
@@ -1608,7 +1741,15 @@ class TestCodecsLargeOIDs(tb.ConnectedTestCase):
             oid = await self.con.fetchval('''
                 SELECT oid FROM pg_type WHERE typname = 'test_domain_t'
             ''')
-            self.assertEqual(oid, 2147483648)
+
+            expected_oid = self.LARGE_OID
+            if self.server_version >= (11, 0):
+                # PostgreSQL 11 automatically create a domain array type
+                # _before_ the domain type, so the expected OID is
+                # off by one.
+                expected_oid += 1
+
+            self.assertEqual(oid, expected_oid)
 
             # Test that introspection handles large OIDs
             v = await self.con.fetchval('SELECT $1::test_domain_t', 10)

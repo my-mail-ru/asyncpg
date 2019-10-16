@@ -36,21 +36,6 @@ else:
         return name
 
 
-if _system == 'Linux':
-    def ensure_dead_with_parent():
-        import ctypes
-        import signal
-
-        try:
-            PR_SET_PDEATHSIG = 1
-            libc = ctypes.CDLL(ctypes.util.find_library('c'))
-            libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-        except Exception as e:
-            print(e)
-else:
-    ensure_dead_with_parent = None
-
-
 def find_available_port(port_range=(49152, 65535), max_tries=1000):
     low, high = port_range
 
@@ -90,6 +75,9 @@ class Cluster:
         self._daemon_process = None
         self._connection_addr = None
         self._connection_spec_override = None
+
+    def get_pg_version(self):
+        return self._pg_version
 
     def is_managed(self):
         return True
@@ -230,8 +218,7 @@ class Cluster:
             self._daemon_process = \
                 subprocess.Popen(
                     [self._postgres, '-D', self._data_dir, *extra_args],
-                    stdout=stdout, stderr=subprocess.STDOUT,
-                    preexec_fn=ensure_dead_with_parent)
+                    stdout=stdout, stderr=subprocess.STDOUT)
 
             self._daemon_pid = self._daemon_process.pid
 
@@ -636,16 +623,33 @@ class HotStandbyCluster(TempCluster):
                 'pg_basebackup init exited with status {:d}:\n{}'.format(
                     process.returncode, output.decode()))
 
-        with open(os.path.join(self._data_dir, 'recovery.conf'), 'w') as f:
-            f.write(textwrap.dedent("""\
-                standby_mode = 'on'
-                primary_conninfo = 'host={host} port={port} user={user}'
-            """.format(
-                host=self._master['host'],
-                port=self._master['port'],
-                user=self._repl_user)))
+        if self._pg_version <= (11, 0):
+            with open(os.path.join(self._data_dir, 'recovery.conf'), 'w') as f:
+                f.write(textwrap.dedent("""\
+                    standby_mode = 'on'
+                    primary_conninfo = 'host={host} port={port} user={user}'
+                """.format(
+                    host=self._master['host'],
+                    port=self._master['port'],
+                    user=self._repl_user)))
+        else:
+            f = open(os.path.join(self._data_dir, 'standby.signal'), 'w')
+            f.close()
 
         return output.decode()
+
+    def start(self, wait=60, *, server_settings={}, **opts):
+        if self._pg_version >= (12, 0):
+            server_settings = server_settings.copy()
+            server_settings['primary_conninfo'] = (
+                'host={host} port={port} user={user}'.format(
+                    host=self._master['host'],
+                    port=self._master['port'],
+                    user=self._repl_user,
+                )
+            )
+
+        super().start(wait=wait, server_settings=server_settings, **opts)
 
 
 class RunningCluster(Cluster):

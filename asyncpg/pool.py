@@ -124,6 +124,8 @@ class PoolConnectionHolder:
 
         self._con = await self._pool._get_new_connection()
         self._generation = self._pool._generation
+        self._maybe_cancel_inactive_callback()
+        self._setup_inactive_callback()
 
     async def acquire(self) -> PoolConnectionProxy:
         if self._con is None or self._con.is_closed():
@@ -664,6 +666,7 @@ class Pool:
 
         self._closing = True
 
+        warning_callback = None
         try:
             warning_callback = self._loop.call_later(
                 60, self._warn_on_long_close)
@@ -681,7 +684,8 @@ class Pool:
             raise
 
         finally:
-            warning_callback.cancel()
+            if warning_callback is not None:
+                warning_callback.cancel()
             self._closed = True
             self._closing = False
 

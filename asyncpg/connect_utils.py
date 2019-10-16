@@ -7,12 +7,14 @@
 
 import asyncio
 import collections
+import functools
 import getpass
 import os
 import pathlib
 import platform
 import re
 import socket
+import ssl as ssl_module
 import stat
 import struct
 import time
@@ -32,6 +34,7 @@ _ConnectionParameters = collections.namedtuple(
         'password',
         'database',
         'ssl',
+        'ssl_is_advisory',
         'connect_timeout',
         'session',
         'server_settings',
@@ -60,23 +63,27 @@ else:
 def _read_password_file(passfile: pathlib.Path) \
         -> typing.List[typing.Tuple[str, ...]]:
 
-    if not passfile.is_file():
-        warnings.warn(
-            'password file {!r} is not a plain file'.format(passfile))
-
-        return None
-
-    if _system != 'Windows':
-        if passfile.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-            warnings.warn(
-                'password file {!r} has group or world access; '
-                'permissions should be u=rw (0600) or less'.format(passfile))
-
-            return None
-
     passtab = []
 
     try:
+        if not passfile.exists():
+            return []
+
+        if not passfile.is_file():
+            warnings.warn(
+                'password file {!r} is not a plain file'.format(passfile))
+
+            return []
+
+        if _system != 'Windows':
+            if passfile.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+                warnings.warn(
+                    'password file {!r} has group or world access; '
+                    'permissions should be u=rw (0600) or less'.format(
+                        passfile))
+
+                return []
+
         with passfile.open('rt') as f:
             for line in f:
                 line = line.strip()
@@ -98,22 +105,21 @@ def _read_password_file(passfile: pathlib.Path) \
 
 def _read_password_from_pgpass(
         *, passfile: typing.Optional[pathlib.Path],
-        hosts: typing.List[typing.Union[str, typing.Tuple[str, int]]],
-        port: int, database: str, user: str):
+        hosts: typing.List[str],
+        ports: typing.List[int],
+        database: str,
+        user: str):
     """Parse the pgpass file and return the matching password.
 
     :return:
         Password string, if found, ``None`` otherwise.
     """
 
-    if not passfile.exists():
-        return None
-
     passtab = _read_password_file(passfile)
     if not passtab:
         return None
 
-    for host in hosts:
+    for host, port in zip(hosts, ports):
         if host.startswith('/'):
             # Unix sockets get normalized into 'localhost'
             host = 'localhost'
@@ -134,38 +140,113 @@ def _read_password_from_pgpass(
     return None
 
 
+def _validate_port_spec(hosts, port):
+    if isinstance(port, list):
+        # If there is a list of ports, its length must
+        # match that of the host list.
+        if len(port) != len(hosts):
+            raise exceptions.InterfaceError(
+                'could not match {} port numbers to {} hosts'.format(
+                    len(port), len(hosts)))
+    else:
+        port = [port for _ in range(len(hosts))]
+
+    return port
+
+
+def _parse_hostlist(hostlist, port, *, unquote=False):
+    if ',' in hostlist:
+        # A comma-separated list of host addresses.
+        hostspecs = hostlist.split(',')
+    else:
+        hostspecs = [hostlist]
+
+    hosts = []
+    hostlist_ports = []
+
+    if not port:
+        portspec = os.environ.get('PGPORT')
+        if portspec:
+            if ',' in portspec:
+                default_port = [int(p) for p in portspec.split(',')]
+            else:
+                default_port = int(portspec)
+        else:
+            default_port = 5432
+
+        default_port = _validate_port_spec(hostspecs, default_port)
+
+    else:
+        port = _validate_port_spec(hostspecs, port)
+
+    for i, hostspec in enumerate(hostspecs):
+        if not hostspec.startswith('/'):
+            addr, _, hostspec_port = hostspec.partition(':')
+        else:
+            addr = hostspec
+            hostspec_port = ''
+
+        if unquote:
+            addr = urllib.parse.unquote(addr)
+
+        hosts.append(addr)
+        if not port:
+            if hostspec_port:
+                if unquote:
+                    hostspec_port = urllib.parse.unquote(hostspec_port)
+                hostlist_ports.append(int(hostspec_port))
+            else:
+                hostlist_ports.append(default_port[i])
+
+    if not port:
+        port = hostlist_ports
+
+    return hosts, port
+
+
 def _parse_connect_dsn_and_args(*, dsn, host, port, user,
                                 password, passfile, database, ssl,
                                 connect_timeout, session, server_settings):
-    if host is not None and not isinstance(host, str):
-        raise TypeError(
-            'host argument is expected to be str, got {!r}'.format(
-                type(host)))
+    # `auth_hosts` is the version of host information for the purposes
+    # of reading the pgpass file.
+    auth_hosts = None
 
     if dsn:
         parsed = urllib.parse.urlparse(dsn)
 
         if parsed.scheme not in {'postgresql', 'postgres'}:
             raise ValueError(
-                'invalid DSN: scheme is expected to be either of '
+                'invalid DSN: scheme is expected to be either '
                 '"postgresql" or "postgres", got {!r}'.format(parsed.scheme))
 
-        if parsed.port and port is None:
-            port = int(parsed.port)
+        if parsed.netloc:
+            if '@' in parsed.netloc:
+                dsn_auth, _, dsn_hostspec = parsed.netloc.partition('@')
+            else:
+                dsn_hostspec = parsed.netloc
+                dsn_auth = ''
+        else:
+            dsn_auth = dsn_hostspec = ''
 
-        if parsed.hostname and host is None:
-            host = parsed.hostname
+        if dsn_auth:
+            dsn_user, _, dsn_password = dsn_auth.partition(':')
+        else:
+            dsn_user = dsn_password = ''
+
+        if not host and dsn_hostspec:
+            host, port = _parse_hostlist(dsn_hostspec, port, unquote=True)
 
         if parsed.path and database is None:
-            database = parsed.path
-            if database.startswith('/'):
-                database = database[1:]
+            dsn_database = parsed.path
+            if dsn_database.startswith('/'):
+                dsn_database = dsn_database[1:]
+            database = urllib.parse.unquote(dsn_database)
 
-        if parsed.username and user is None:
-            user = parsed.username
+        if user is None and dsn_user:
+            user = urllib.parse.unquote(dsn_user)
 
-        if parsed.password and password is None:
-            password = parsed.password
+        if password is None and dsn_password:
+            password = urllib.parse.unquote(dsn_password)
 
         if parsed.query:
             query = urllib.parse.parse_qs(parsed.query, strict_parsing=True)
@@ -173,15 +254,15 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
                 if isinstance(val, list):
                     query[key] = val[-1]
 
+            if 'port' in query:
+                val = query.pop('port')
+                if not port and val:
+                    port = [int(p) for p in val.split(',')]
+
             if 'host' in query:
                 val = query.pop('host')
-                if host is None:
-                    host = val
-
-            if 'port' in query:
-                val = int(query.pop('port'))
-                if port is None:
-                    port = val
+                if not host and val:
+                    host, port = _parse_hostlist(val, port)
 
             if 'dbname' in query:
                 val = query.pop('dbname')
@@ -208,30 +289,30 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
                 if passfile is None:
                     passfile = val
 
+            if 'sslmode' in query:
+                val = query.pop('sslmode')
+                if ssl is None:
+                    ssl = val
+
             if query:
                 if server_settings is None:
                     server_settings = query
                 else:
                     server_settings = {**query, **server_settings}
 
-    # On env-var -> connection parameter conversion read here:
-    # https://www.postgresql.org/docs/current/static/libpq-envars.html
-    # Note that env values may be an empty string in cases when
-    # the variable is "unset" by setting it to an empty value
-    # `auth_hosts` is the version of host information for the purposes
-    # of reading the pgpass file.
-    auth_hosts = None
-    if host is None:
-        host = os.getenv('PGHOST')
-        if not host:
-            auth_hosts = ['localhost']
+    if not host:
+        hostspec = os.environ.get('PGHOST')
+        if hostspec:
+            host, port = _parse_hostlist(hostspec, port)
 
-            if _system == 'Windows':
-                host = ['localhost']
-            else:
-                host = ['/tmp', '/private/tmp',
-                        '/var/pgsql_socket', '/run/postgresql',
-                        'localhost']
+    if not host:
+        auth_hosts = ['localhost']
+
+        if _system == 'Windows':
+            host = ['localhost']
+        else:
+            host = ['/run/postgresql', '/var/run/postgresql',
+                    '/tmp', '/private/tmp', 'localhost']
 
     if not isinstance(host, list):
         host = [host]
@@ -239,14 +320,23 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
     if auth_hosts is None:
         auth_hosts = host
 
-    if port is None:
-        port = os.getenv('PGPORT')
-        if port:
-            port = int(port)
+    if not port:
+        portspec = os.environ.get('PGPORT')
+        if portspec:
+            if ',' in portspec:
+                port = [int(p) for p in portspec.split(',')]
+            else:
+                port = int(portspec)
         else:
             port = 5432
+
+    elif isinstance(port, (list, tuple)):
+        port = [int(p) for p in port]
+
     else:
         port = int(port)
+
+    port = _validate_port_spec(host, port)
 
     if user is None:
         user = os.getenv('PGUSER')
@@ -285,23 +375,66 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
 
         if passfile is not None:
             password = _read_password_from_pgpass(
-                hosts=auth_hosts, port=port, database=database, user=user,
+                hosts=auth_hosts, ports=port,
+                database=database, user=user,
                 passfile=passfile)
 
     addrs = []
-    for h in host:
+    for h, p in zip(host, port):
         if h.startswith('/'):
             # UNIX socket name
             if '.s.PGSQL.' not in h:
-                h = os.path.join(h, '.s.PGSQL.{}'.format(port))
+                h = os.path.join(h, '.s.PGSQL.{}'.format(p))
             addrs.append(h)
         else:
             # TCP host/port
-            addrs.append((h, port))
+            addrs.append((h, p))
 
     if not addrs:
         raise ValueError(
             'could not determine the database address to connect to')
+
+    if ssl is None:
+        ssl = os.getenv('PGSSLMODE')
+
+    # ssl_is_advisory is only allowed to come from the sslmode parameter.
+    ssl_is_advisory = None
+    if isinstance(ssl, str):
+        SSLMODES = {
+            'disable': 0,
+            'allow': 1,
+            'prefer': 2,
+            'require': 3,
+            'verify-ca': 4,
+            'verify-full': 5,
+        }
+        try:
+            sslmode = SSLMODES[ssl]
+        except KeyError:
+            modes = ', '.join(SSLMODES.keys())
+            raise exceptions.InterfaceError(
+                '`sslmode` parameter must be one of: {}'.format(modes))
+
+        # sslmode 'allow' is currently handled as 'prefer' because we're
+        # missing the "retry with SSL" behavior for 'allow', but do have the
+        # "retry without SSL" behavior for 'prefer'.
+        # Not changing 'allow' to 'prefer' here would be effectively the same
+        # as changing 'allow' to 'disable'.
+        if sslmode == SSLMODES['allow']:
+            sslmode = SSLMODES['prefer']
+
+        # docs at https://www.postgresql.org/docs/10/static/libpq-connect.html
+        # Not implemented: sslcert & sslkey & sslrootcert & sslcrl params.
+        if sslmode <= SSLMODES['allow']:
+            ssl = False
+            ssl_is_advisory = sslmode >= SSLMODES['allow']
+        else:
+            ssl = ssl_module.create_default_context()
+            ssl.check_hostname = sslmode >= SSLMODES['verify-full']
+            ssl.verify_mode = ssl_module.CERT_REQUIRED
+            if sslmode <= SSLMODES['require']:
+                ssl.verify_mode = ssl_module.CERT_NONE
+            ssl_is_advisory = sslmode <= SSLMODES['prefer']
 
     if ssl:
         for addr in addrs:
@@ -321,7 +454,7 @@ def _parse_connect_dsn_and_args(*, dsn, host, port, user,
 
     params = _ConnectionParameters(
         user=user, password=password, database=database, ssl=ssl,
-        connect_timeout=connect_timeout, session=session,
+        ssl_is_advisory=ssl_is_advisory, connect_timeout=connect_timeout, session=session,
         server_settings=server_settings)
 
     return addrs, params
@@ -385,11 +518,12 @@ async def _connect_addr(*, addr, loop, timeout, params, config,
 
     if isinstance(addr, str):
         # UNIX socket
-        assert params.ssl is None
+        assert not params.ssl
         connector = loop.create_unix_connection(proto_factory, addr)
     elif params.ssl:
         connector = _create_ssl_connection(
-            proto_factory, *addr, loop=loop, ssl_context=params.ssl)
+            proto_factory, *addr, loop=loop, ssl_context=params.ssl,
+            ssl_is_advisory=params.ssl_is_advisory)
     else:
         connector = loop.create_connection(proto_factory, *addr)
 
@@ -436,7 +570,12 @@ async def _connect(*, loop, timeout, connection_class, **kwargs):
     raise last_error
 
 
-async def _get_ssl_ready_socket(host, port, *, loop):
+async def _negotiate_ssl_connection(host, port, conn_factory, *, loop, ssl,
+                                    server_hostname, ssl_is_advisory=False):
+    # Note: ssl_is_advisory only affects behavior when the server does not
+    # accept SSLRequests. If the SSLRequest is accepted but either the SSL
+    # negotiation fails or the PostgreSQL user isn't permitted to use SSL,
+    # there's nothing that would attempt to reconnect with a non-SSL socket.
     reader, writer = await asyncio.open_connection(host, port, loop=loop)
 
     tr = writer.transport
@@ -449,25 +588,41 @@ async def _get_ssl_ready_socket(host, port, *, loop):
         resp = await reader.readexactly(1)
 
         if resp == b'S':
-            return sock.dup()
+            conn_factory = functools.partial(
+                conn_factory, ssl=ssl, server_hostname=server_hostname)
+        elif (ssl_is_advisory and
+                ssl.verify_mode == ssl_module.CERT_NONE and
+                resp == b'N'):
+            # ssl_is_advisory will imply that ssl.verify_mode == CERT_NONE,
+            # since the only way to get ssl_is_advisory is from sslmode=prefer
+            # (or sslmode=allow). But be extra sure to disallow insecure
+            # connections when the ssl context asks for real security.
+            pass
         else:
             raise ConnectionError(
                 'PostgreSQL server at "{}:{}" rejected SSL upgrade'.format(
                     host, port))
+
+        sock = sock.dup()  # Must come before tr.close()
     finally:
         tr.close()
 
-
-async def _create_ssl_connection(protocol_factory, host, port, *,
-                                 loop, ssl_context):
-    sock = await _get_ssl_ready_socket(host, port, loop=loop)
     try:
-        return await loop.create_connection(
-            protocol_factory, sock=sock, ssl=ssl_context,
-            server_hostname=host)
+        return await conn_factory(sock=sock)  # Must come after tr.close()
     except Exception:
         sock.close()
         raise
+
+
+async def _create_ssl_connection(protocol_factory, host, port, *,
+                                 loop, ssl_context, ssl_is_advisory=False):
+    return await _negotiate_ssl_connection(
+        host, port,
+        functools.partial(loop.create_connection, protocol_factory),
+        loop=loop,
+        ssl=ssl_context,
+        server_hostname=host,
+        ssl_is_advisory=ssl_is_advisory)
 
 
 async def _open_connection(*, loop, addr, params: _ConnectionParameters):
@@ -475,18 +630,13 @@ async def _open_connection(*, loop, addr, params: _ConnectionParameters):
         r, w = await asyncio.open_unix_connection(addr, loop=loop)
     else:
         if params.ssl:
-            sock = await _get_ssl_ready_socket(*addr, loop=loop)
-
-            try:
-                r, w = await asyncio.open_connection(
-                    sock=sock,
-                    loop=loop,
-                    ssl=params.ssl,
-                    server_hostname=addr[0])
-            except Exception:
-                sock.close()
-                raise
-
+            r, w = await _negotiate_ssl_connection(
+                *addr,
+                functools.partial(asyncio.open_connection, loop=loop),
+                loop=loop,
+                ssl=params.ssl,
+                server_hostname=addr[0],
+                ssl_is_advisory=params.ssl_is_advisory)
         else:
             r, w = await asyncio.open_connection(*addr, loop=loop)
             _set_nodelay(_get_socket(w.transport))
